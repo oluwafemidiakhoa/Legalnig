@@ -21,9 +21,14 @@ from legal_mvp.auth import (
 )
 from legal_mvp.billing import (
     TIER_DEFINITIONS,
+    check_qa_allowed,
+    check_doc_allowed,
+    check_contract_allowed,
     create_billing_record,
     create_subscription,
+    get_user_tier,
 )
+from legal_mvp.cache import question_hash as _question_hash
 from legal_mvp.compliance import generate_compliance_calendar, update_obligation_statuses
 from legal_mvp.contract_review import create_contract_review, run_ai_contract_review
 from legal_mvp.embeddings import get_embedding_backend_name, get_embedding_model_name
@@ -37,9 +42,12 @@ from legal_mvp.runtime_env import load_env_file
 from legal_mvp.storage import (
     append_matter_artifacts,
     cancel_subscription,
+    count_usage_today,
+    count_usage_this_month,
     delete_session,
     get_answer_drafts,
     get_billing_records,
+    get_cached_answer,
     get_compliance_obligations,
     get_contract_review,
     get_contract_reviews,
@@ -57,6 +65,7 @@ from legal_mvp.storage import (
     initialize_storage,
     list_sources,
     list_users,
+    log_usage,
     matter_exists,
     review_answer_draft,
     save_answer_draft,
@@ -70,6 +79,7 @@ from legal_mvp.storage import (
     save_user,
     search_citations,
     search_sources,
+    store_cached_answer,
     update_compliance_obligation,
     update_contract_review,
     update_generated_document,
@@ -167,11 +177,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 session = self._require_auth()
                 if not session:
                     return
-                user = get_user_by_id(session["user_id"])
-                subscription = get_subscription_by_user(session["user_id"])
+                uid = session["user_id"]
+                user = get_user_by_id(uid)
+                subscription = get_subscription_by_user(uid)
+                billing = get_billing_records(uid)
+                tier_name = get_user_tier(subscription, billing)
                 self.send_json({
                     "user": safe_user_dict(user) if user else None,
                     "subscription": subscription,
+                    "tier": tier_name,
                 })
                 return
 
@@ -281,6 +295,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not session:
                     return
                 self.send_json({"items": get_billing_records(session["user_id"])})
+                return
+
+            if route == "/api/billing/usage":
+                session = self._require_auth("sme_founder", "lawyer", "admin")
+                if not session:
+                    return
+                uid = session["user_id"]
+                sub = get_subscription_by_user(uid)
+                billing = get_billing_records(uid)
+                tier_name = get_user_tier(sub, billing)
+                from legal_mvp.billing import TIER_DEFINITIONS as _TD
+                tier_def = _TD.get(tier_name, {})
+                self.send_json({
+                    "tier": tier_name,
+                    "tier_def": tier_def,
+                    "daily_ai_used": count_usage_today(uid),
+                    "monthly_qa_used": count_usage_this_month(uid, "qa"),
+                    "monthly_docs_used": count_usage_this_month(uid, "document"),
+                    "monthly_contracts_used": count_usage_this_month(uid, "contract_review"),
+                })
                 return
 
             # ── Compliance ────────────────────────────────────────────────────
@@ -455,6 +489,33 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("matter_id must be a non-empty string when provided.")
                 if isinstance(matter_id, str) and matter_id.strip() and not matter_exists(matter_id.strip()):
                     raise ValueError("matter_id does not match an existing matter.")
+
+                # Rate limiting — check tier
+                user_id = session["user_id"]
+                subscription = get_subscription_by_user(user_id)
+                billing_records = get_billing_records(user_id)
+                tier_name = get_user_tier(subscription, billing_records)
+                daily_count = count_usage_today(user_id)
+                monthly_qa = count_usage_this_month(user_id, "qa")
+                qa_ok, qa_reason = check_qa_allowed(tier_name, daily_count, monthly_qa)
+                if not qa_ok:
+                    self.send_json({
+                        "error": "limit_reached",
+                        "reason": qa_reason,
+                        "tier": tier_name,
+                        "upgrade_url": "/billing",
+                    }, status=HTTPStatus.PAYMENT_REQUIRED)
+                    return
+
+                # Cache lookup
+                q_hash = _question_hash(question.strip(), jurisdiction)
+                cached = get_cached_answer(q_hash, jurisdiction)
+                if cached:
+                    log_usage(user_id, "qa", tier_name, cache_hit=True)
+                    cached["from_cache"] = True
+                    self.send_json(cached, status=HTTPStatus.OK)
+                    return
+
                 citations = search_citations(question, limit=5, jurisdiction=jurisdiction)
                 draft = generate_answer_draft(question, citations, jurisdiction=jurisdiction)
                 if isinstance(matter_id, str) and matter_id.strip():
@@ -473,8 +534,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     matter = build_matter_for_answer(question, draft)
                     draft["matter_id"] = matter.id
                     upsert_matter(matter)
-                    update_user_matter_ids(session["user_id"], matter.id)
+                    update_user_matter_ids(user_id, matter.id)
                 save_answer_draft(draft)
+                store_cached_answer(q_hash, question.strip(), draft, jurisdiction)
+                log_usage(user_id, "qa", tier_name, matter_id=draft.get("matter_id"), cache_hit=False)
                 self.send_json(draft, status=HTTPStatus.CREATED)
                 return
 
@@ -594,6 +657,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 variables = payload.get("variables", {})
                 if not matter_id or not matter_exists(matter_id):
                     raise ValueError("matter_id must reference an existing matter.")
+
+                # Rate limiting
+                user_id = session["user_id"]
+                subscription = get_subscription_by_user(user_id)
+                billing_records = get_billing_records(user_id)
+                tier_name = get_user_tier(subscription, billing_records)
+                monthly_docs = count_usage_this_month(user_id, "document")
+                doc_ok, doc_reason = check_doc_allowed(tier_name, monthly_docs)
+                if not doc_ok:
+                    self.send_json({
+                        "error": "limit_reached",
+                        "reason": doc_reason,
+                        "tier": tier_name,
+                        "upgrade_url": "/billing",
+                    }, status=HTTPStatus.PAYMENT_REQUIRED)
+                    return
+
                 body_text = fill_template(template_key, variables)
                 from uuid import uuid4
                 now = datetime.now(timezone.utc).isoformat()
@@ -608,6 +688,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     version_number=1,
                 )
                 save_generated_document(doc.to_dict())
+                log_usage(user_id, "document", tier_name, matter_id=matter_id)
                 self.send_json({"document": doc.to_dict()}, status=HTTPStatus.CREATED)
                 return
 
@@ -641,6 +722,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("matter_id must reference an existing matter.")
                 if not raw_text:
                     raise ValueError("raw_text must not be empty.")
+
+                # Rate limiting
+                _cr_user_id = session["user_id"]
+                _cr_sub = get_subscription_by_user(_cr_user_id)
+                _cr_billing = get_billing_records(_cr_user_id)
+                _cr_tier = get_user_tier(_cr_sub, _cr_billing)
+                _cr_monthly = count_usage_this_month(_cr_user_id, "contract_review")
+                cr_ok, cr_reason = check_contract_allowed(_cr_tier, _cr_monthly)
+                if not cr_ok:
+                    self.send_json({
+                        "error": "limit_reached",
+                        "reason": cr_reason,
+                        "tier": _cr_tier,
+                        "upgrade_url": "/billing",
+                    }, status=HTTPStatus.PAYMENT_REQUIRED)
+                    return
+
                 record = create_contract_review(matter_id, session["user_id"], filename, raw_text)
                 record_dict = record.to_dict()
                 save_contract_review(record_dict)
@@ -653,6 +751,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "status": record_dict["status"],
                     "updated_at": record_dict["updated_at"],
                 })
+                log_usage(_cr_user_id, "contract_review", _cr_tier, matter_id=matter_id)
                 self.send_json({"contract_review": {k: v for k, v in record_dict.items() if k != "raw_text"}}, status=HTTPStatus.CREATED)
                 return
 
@@ -717,8 +816,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not session:
                     return
                 tier = str(payload.get("tier", "")).strip()
-                if tier not in ("starter", "growth", "scale", "law_firm"):
-                    raise ValueError("Invalid tier.")
+                if tier not in TIER_DEFINITIONS or TIER_DEFINITIONS[tier].get("price_ngn", 0) <= 0:
+                    raise ValueError("Invalid or free tier — cannot initialize payment.")
                 user = get_user_by_id(session["user_id"])
                 if not user:
                     raise LookupError("User not found.")
@@ -744,23 +843,31 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("reference is required.")
                 data = verify_transaction(reference)
                 metadata = data.get("metadata", {})
-                tier = metadata.get("tier", "starter")
+                tier = metadata.get("tier", "professional")
                 amount_ngn = data["amount"] / 100
                 user = get_user_by_id(session["user_id"])
-                # Create billing record + subscription
+                tier_def = TIER_DEFINITIONS.get(tier, {})
                 billing_rec = create_billing_record(session["user_id"], tier, seat_count=1)
                 billing_rec_dict = billing_rec.to_dict()
                 billing_rec_dict["status"] = "paid"
                 billing_rec_dict["description"] = f"Paystack payment — ref {reference}"
                 save_billing_record(billing_rec_dict)
-                sub = create_subscription(session["user_id"], tier, seat_count=1)
-                save_subscription(sub.to_dict())
-                if user:
-                    try:
-                        send_payment_receipt(user["email"], user["display_name"], tier, amount_ngn, reference)
-                    except Exception:
-                        pass
-                self.send_json({"subscription": sub.to_dict(), "reference": reference})
+                if tier_def.get("billing_type") == "one_time":
+                    if user:
+                        try:
+                            send_payment_receipt(user["email"], user["display_name"], tier, amount_ngn, reference)
+                        except Exception:
+                            pass
+                    self.send_json({"subscription": None, "billing_record": billing_rec_dict, "reference": reference})
+                else:
+                    sub = create_subscription(session["user_id"], tier, seat_count=1)
+                    save_subscription(sub.to_dict())
+                    if user:
+                        try:
+                            send_payment_receipt(user["email"], user["display_name"], tier, amount_ngn, reference)
+                        except Exception:
+                            pass
+                    self.send_json({"subscription": sub.to_dict(), "reference": reference})
                 return
 
             if path == "/api/billing/paystack/webhook":
@@ -774,17 +881,19 @@ class AppHandler(BaseHTTPRequestHandler):
                 if event.get("event") == "charge.success":
                     ref  = event["data"]["reference"]
                     meta = event["data"].get("metadata", {})
-                    tier = meta.get("tier", "starter")
+                    tier = meta.get("tier", "professional")
                     user_id = meta.get("user_id", "")
                     amount_ngn = event["data"]["amount"] / 100
                     if user_id:
+                        wh_tier_def = TIER_DEFINITIONS.get(tier, {})
                         billing_rec = create_billing_record(user_id, tier, seat_count=1)
                         br = billing_rec.to_dict()
                         br["status"] = "paid"
                         br["description"] = f"Paystack webhook — ref {ref}"
                         save_billing_record(br)
-                        sub = create_subscription(user_id, tier, seat_count=1)
-                        save_subscription(sub.to_dict())
+                        if wh_tier_def.get("billing_type") != "one_time":
+                            sub = create_subscription(user_id, tier, seat_count=1)
+                            save_subscription(sub.to_dict())
                         user = get_user_by_id(user_id)
                         if user:
                             try:

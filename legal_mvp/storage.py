@@ -59,6 +59,8 @@ class JsonStorageBackend:
             DATA_DIR / "compliance_obligations.json",
             DATA_DIR / "generated_documents.json",
             DATA_DIR / "contract_reviews.json",
+            DATA_DIR / "answer_cache.json",
+            DATA_DIR / "usage_log.json",
         ]
         for path in _new_json_files:
             if not path.exists():
@@ -514,6 +516,74 @@ class JsonStorageBackend:
         self._write_records(DATA_DIR / "contract_reviews.json", records)
         return found
 
+    # ── Answer cache ──────────────────────────────────────────────────────────
+
+    def get_cached_answer(self, q_hash: str, jurisdiction: str) -> dict[str, Any] | None:
+        from legal_mvp.cache import is_cache_fresh
+        cache = self._load_records(DATA_DIR / "answer_cache.json")
+        for entry in cache:
+            if entry.get("question_hash") == q_hash and entry.get("jurisdiction") == jurisdiction:
+                if is_cache_fresh(entry["created_at"]):
+                    entry["hit_count"] = entry.get("hit_count", 0) + 1
+                    entry["last_hit_at"] = datetime.now(timezone.utc).isoformat()
+                    self._write_records(DATA_DIR / "answer_cache.json", cache)
+                    return entry.get("answer_json")
+        return None
+
+    def store_cached_answer(self, q_hash: str, question: str, answer: dict[str, Any], jurisdiction: str) -> None:
+        from uuid import uuid4
+        cache = self._load_records(DATA_DIR / "answer_cache.json")
+        cache = [e for e in cache if not (e.get("question_hash") == q_hash and e.get("jurisdiction") == jurisdiction)]
+        cache.append({
+            "id": str(uuid4()),
+            "question_hash": q_hash,
+            "jurisdiction": jurisdiction,
+            "question_text": question,
+            "answer_json": answer,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "hit_count": 0,
+            "last_hit_at": None,
+        })
+        self._write_records(DATA_DIR / "answer_cache.json", cache)
+
+    # ── Usage tracking ────────────────────────────────────────────────────────
+
+    def log_usage(self, user_id: str, action_type: str, tier: str, matter_id: str | None = None, cache_hit: bool = False) -> None:
+        from uuid import uuid4
+        entry = {
+            "id": str(uuid4()),
+            "user_id": user_id,
+            "action_type": action_type,
+            "tier": tier,
+            "matter_id": matter_id,
+            "cache_hit": cache_hit,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._append_record(DATA_DIR / "usage_log.json", entry)
+
+    def count_usage_today(self, user_id: str) -> int:
+        from datetime import date
+        today = date.today().isoformat()
+        log = self._load_records(DATA_DIR / "usage_log.json")
+        return sum(
+            1 for e in log
+            if e.get("user_id") == user_id
+            and str(e.get("created_at", "")).startswith(today)
+            and not e.get("cache_hit", False)
+        )
+
+    def count_usage_this_month(self, user_id: str, action_type: str) -> int:
+        from datetime import date
+        month_prefix = date.today().isoformat()[:7]
+        log = self._load_records(DATA_DIR / "usage_log.json")
+        return sum(
+            1 for e in log
+            if e.get("user_id") == user_id
+            and e.get("action_type") == action_type
+            and str(e.get("created_at", "")).startswith(month_prefix)
+            and not e.get("cache_hit", False)
+        )
+
 
 class PostgresStorageBackend:
     name = "postgres"
@@ -523,12 +593,13 @@ class PostgresStorageBackend:
 
     def initialize(self) -> None:
         schema_sql = SCHEMA_FILE.read_text(encoding="utf-8")
-        schema2_file = SQL_DIR / "002_auth_billing_compliance.sql"
         with psycopg.connect(self.database_url) as conn:
             with conn.cursor() as cur:
                 cur.execute(schema_sql)
-                if schema2_file.exists():
-                    cur.execute(schema2_file.read_text(encoding="utf-8"))
+                for migration in ["002_auth_billing_compliance.sql", "003_cache_usage.sql"]:
+                    mf = SQL_DIR / migration
+                    if mf.exists():
+                        cur.execute(mf.read_text(encoding="utf-8"))
             conn.commit()
         self.seed_sources()
         self.ingest_source_documents()
@@ -1762,6 +1833,71 @@ class PostgresStorageBackend:
         )
         return overall_status
 
+    # ── Answer cache (Postgres) ───────────────────────────────────────────────
+
+    def get_cached_answer(self, q_hash: str, jurisdiction: str) -> dict[str, Any] | None:
+        from legal_mvp.cache import is_cache_fresh
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT answer_json, created_at FROM lp_answer_cache WHERE question_hash = %s AND jurisdiction = %s",
+                    (q_hash, jurisdiction),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                if not is_cache_fresh(row["created_at"]):
+                    return None
+                cur.execute(
+                    "UPDATE lp_answer_cache SET hit_count = hit_count + 1, last_hit_at = NOW() WHERE question_hash = %s AND jurisdiction = %s",
+                    (q_hash, jurisdiction),
+                )
+            conn.commit()
+        return row["answer_json"]
+
+    def store_cached_answer(self, q_hash: str, question: str, answer: dict[str, Any], jurisdiction: str) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO lp_answer_cache (question_hash, jurisdiction, question_text, answer_json)
+                       VALUES (%s, %s, %s, %s::jsonb)
+                       ON CONFLICT (question_hash, jurisdiction) DO UPDATE
+                       SET answer_json = EXCLUDED.answer_json, created_at = NOW(), hit_count = 0""",
+                    (q_hash, jurisdiction, question, json.dumps(answer)),
+                )
+            conn.commit()
+
+    # ── Usage tracking (Postgres) ─────────────────────────────────────────────
+
+    def log_usage(self, user_id: str, action_type: str, tier: str, matter_id: str | None = None, cache_hit: bool = False) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO lp_usage_log (user_id, action_type, tier, matter_id, cache_hit) VALUES (%s, %s, %s, %s, %s)",
+                    (user_id, action_type, tier, matter_id, cache_hit),
+                )
+            conn.commit()
+
+    def count_usage_today(self, user_id: str) -> int:
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM lp_usage_log WHERE user_id = %s AND created_at >= CURRENT_DATE AND cache_hit = false",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+                return int(row["cnt"]) if row else 0
+
+    def count_usage_this_month(self, user_id: str, action_type: str) -> int:
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM lp_usage_log WHERE user_id = %s AND action_type = %s AND created_at >= date_trunc('month', CURRENT_DATE) AND cache_hit = false",
+                    (user_id, action_type),
+                )
+                row = cur.fetchone()
+                return int(row["cnt"]) if row else 0
+
     def _normalize_rows(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         from datetime import date as _date, datetime as _datetime
         import uuid as _uuid
@@ -2031,3 +2167,23 @@ def get_contract_review(review_id: str) -> dict[str, Any] | None:
 
 def update_contract_review(review_id: str, updates: dict[str, Any]) -> dict[str, Any]:
     return get_backend().update_contract_review(review_id, updates)
+
+
+# ── Answer cache ─────────────────────────────────────────────────────────────
+
+def get_cached_answer(q_hash: str, jurisdiction: str) -> dict[str, Any] | None:
+    return get_backend().get_cached_answer(q_hash, jurisdiction)
+
+def store_cached_answer(q_hash: str, question: str, answer: dict[str, Any], jurisdiction: str) -> None:
+    get_backend().store_cached_answer(q_hash, question, answer, jurisdiction)
+
+# ── Usage tracking ────────────────────────────────────────────────────────────
+
+def log_usage(user_id: str, action_type: str, tier: str, matter_id: str | None = None, cache_hit: bool = False) -> None:
+    get_backend().log_usage(user_id, action_type, tier, matter_id=matter_id, cache_hit=cache_hit)
+
+def count_usage_today(user_id: str) -> int:
+    return get_backend().count_usage_today(user_id)
+
+def count_usage_this_month(user_id: str, action_type: str) -> int:
+    return get_backend().count_usage_this_month(user_id, action_type)

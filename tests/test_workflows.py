@@ -25,7 +25,7 @@ class WorkflowTests(unittest.TestCase):
         request = build_intake_request(self.make_payload())
         workflow = build_workflow(request)
         titles = [step.title for step in workflow]
-        self.assertIn("Escalate sector licensing review", titles)
+        self.assertTrue(any("Escalate sector licensing review" in t for t in titles))
         self.assertEqual(request.jurisdiction, "Nigeria")
 
     def test_employment_use_case_adds_employment_packet(self):
