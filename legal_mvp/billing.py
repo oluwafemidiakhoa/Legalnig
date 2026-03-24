@@ -64,6 +64,7 @@ TIER_DEFINITIONS: dict[str, dict] = {
         "name": "Law Firm",
         "description": "Practice management software licence for law firms — per seat",
         "billing_type": "monthly",
+        "price_ngn": 75_000,
         "price_per_seat_ngn": 75_000,
         "features": [
             "Everything in Scale",

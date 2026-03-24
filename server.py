@@ -521,11 +521,19 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 tier = str(payload.get("tier", "")).strip()
                 seat_count = int(payload.get("seat_count", 1))
+                tier_def = TIER_DEFINITIONS.get(tier)
+                if not tier_def:
+                    raise ValueError(f"Unknown tier: {tier}")
                 billing_rec = create_billing_record(session["user_id"], tier, seat_count=seat_count)
-                save_billing_record(billing_rec.to_dict())
-                sub = create_subscription(session["user_id"], tier, seat_count=seat_count)
-                save_subscription(sub.to_dict())
-                self.send_json({"subscription": sub.to_dict(), "billing_record": billing_rec.to_dict()}, status=HTTPStatus.CREATED)
+                billing_rec_dict = billing_rec.to_dict()
+                billing_rec_dict["status"] = "paid"
+                save_billing_record(billing_rec_dict)
+                if tier_def.get("billing_type") == "one_time":
+                    self.send_json({"subscription": None, "billing_record": billing_rec_dict, "activated": True}, status=HTTPStatus.CREATED)
+                else:
+                    sub = create_subscription(session["user_id"], tier, seat_count=seat_count)
+                    save_subscription(sub.to_dict())
+                    self.send_json({"subscription": sub.to_dict(), "billing_record": billing_rec_dict, "activated": True}, status=HTTPStatus.CREATED)
                 return
 
             if path == "/api/billing/cancel":

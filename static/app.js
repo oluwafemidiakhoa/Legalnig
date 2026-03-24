@@ -714,61 +714,119 @@ async function approveContract() {
 }
 
 /* ── Billing ────────────────────────────────────────────────────────────── */
+let _billingTiers = {};
+
 async function loadBilling() {
+  const currentEl  = document.getElementById('billing-current');
+  const tierGridEl = document.getElementById('tier-grid');
+  const invoiceEl  = document.getElementById('invoice-list');
+  currentEl.innerHTML = '<div style="color:var(--ink-muted)">Loading…</div>';
+
   try {
     const [tiersRes, subRes, invoicesRes] = await Promise.all([
       apiGet('/api/billing/tiers'),
-      apiGet('/api/billing/subscription').catch(() => ({ subscription: null })),
-      apiGet('/api/billing/invoices').catch(() => ({ invoices: [] })),
+      apiGet('/api/billing/subscription').catch(() => ({})),
+      apiGet('/api/billing/invoices').catch(() => ({})),
     ]);
-    const tiers    = tiersRes.tiers    || {};
-    const sub      = subRes.subscription;
-    const invoices = invoicesRes.items || [];
+    _billingTiers   = tiersRes.tiers || {};
+    const sub       = subRes.subscription || null;
+    const billingRecs = subRes.billing_records || invoicesRes.items || [];
 
-    // Current plan
-    document.getElementById('billing-current').innerHTML = sub
-      ? `<div style="font-weight:700;font-size:16px;margin-bottom:8px">Current plan: ${esc(sub.tier)}</div>
-         <div style="color:var(--ink-muted);font-size:14px">Status: ${esc(sub.status)} · Next billing: ${fmtDate(sub.next_billing_at)}</div>
-         <button class="btn btn-outline btn-sm" style="margin-top:12px" onclick="cancelSub()">Cancel subscription</button>`
-      : `<div style="color:var(--ink-muted)">No active subscription. Choose a plan below.</div>`;
+    // ── Current plan banner ──────────────────────────────────────────────
+    if (sub) {
+      const td = _billingTiers[sub.tier] || {};
+      currentEl.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+          <div>
+            <div style="font-weight:700;font-size:17px;margin-bottom:4px">
+              ${esc(td.name || sub.tier)} plan <span class="badge badge-green">${esc(sub.status)}</span>
+            </div>
+            <div style="color:var(--ink-muted);font-size:14px">
+              ${fmtNGN(td.price_ngn || 0)} · Next billing: ${fmtDate(sub.next_billing_at)}
+            </div>
+          </div>
+          <button class="btn btn-outline btn-sm" onclick="cancelSub()">Cancel subscription</button>
+        </div>`;
+    } else if (billingRecs.length) {
+      // One-time purchase (no subscription record)
+      const last = billingRecs[0];
+      const td   = _billingTiers[last.service_tier] || {};
+      currentEl.innerHTML = `
+        <div style="font-weight:700;font-size:17px;margin-bottom:4px">
+          ${esc(td.name || last.service_tier)} <span class="badge badge-green">Active</span>
+        </div>
+        <div style="color:var(--ink-muted);font-size:14px">One-time purchase · Paid ${fmtDate(last.created_at)}</div>`;
+    } else {
+      currentEl.innerHTML = `<div style="color:var(--ink-muted)">No active plan. Choose one below to unlock full access.</div>`;
+    }
 
-    // Tier grid
-    document.getElementById('tier-grid').innerHTML = Object.entries(tiers).map(([key, t]) => {
-      const price = t.price_ngn ? fmtNGN(t.price_ngn) + (t.billing_cycle ? ' / ' + t.billing_cycle : '') : 'Custom';
-      const isCurrent = sub?.tier === key;
-      return `<div class="tier-card ${isCurrent ? 'tier-current' : ''}">
+    // ── Tier grid ────────────────────────────────────────────────────────
+    const activeTier = sub?.tier || (billingRecs[0]?.service_tier);
+    tierGridEl.innerHTML = Object.entries(_billingTiers).map(([key, t]) => {
+      const isActive  = activeTier === key;
+      const isOneTime = t.billing_type === 'one_time';
+      const isCustom  = !t.price_ngn;
+      const priceLabel = isCustom
+        ? '<span style="font-size:18px;font-weight:700">Custom</span>'
+        : `<span style="font-size:22px;font-weight:700">${fmtNGN(t.price_ngn)}</span>`
+          + `<span style="font-size:13px;color:var(--ink-muted)"> ${isOneTime ? 'one-time' : '/ month'}</span>`;
+
+      const btn = isActive
+        ? `<div class="badge badge-green" style="text-align:center;padding:10px">Current plan</div>`
+        : isCustom
+        ? `<a href="mailto:foundryai@getfoundryai.com?subject=Law Firm Plan Enquiry" class="btn btn-outline btn-sm" style="width:100%;text-align:center">Contact us</a>`
+        : `<button class="btn btn-primary btn-sm" style="width:100%" onclick="subscribe('${key}',this)">
+             Activate ${esc(t.name)}
+           </button>`;
+
+      return `<div class="tier-card${isActive ? ' tier-current' : ''}">
         <div class="tier-name">${esc(t.name)}</div>
-        <div class="tier-price">${price}</div>
-        <ul class="tier-features">${(t.features||[]).map(f=>`<li>${esc(f)}</li>`).join('')}</ul>
-        ${!isCurrent ? `<button class="btn btn-primary btn-sm" onclick="subscribe('${esc(key)}')">Choose ${esc(t.name)}</button>` : '<span class="badge badge-green">Current</span>'}
+        <div class="tier-price" style="margin:12px 0">${priceLabel}</div>
+        <ul class="tier-features" style="margin-bottom:16px">${(t.features||[]).map(f=>`<li>${esc(f)}</li>`).join('')}</ul>
+        ${btn}
       </div>`;
     }).join('');
 
-    // Invoice history
-    document.getElementById('invoice-list').innerHTML = invoices.length
-      ? invoices.map(inv =>
-          `<div class="queue-item">
-            <div style="font-weight:600">${esc(inv.description)}</div>
-            <div style="font-size:13px;color:var(--ink-muted)">${fmtDate(inv.created_at)} · ${fmtNGN(inv.amount_ngn)} · <span class="badge ${inv.status==='paid'?'badge-green':''}">${esc(inv.status)}</span></div>
-          </div>`
-        ).join('')
-      : '<div style="color:var(--ink-muted);font-size:14px">No invoices yet.</div>';
+    // ── Invoice history ──────────────────────────────────────────────────
+    invoiceEl.innerHTML = billingRecs.length
+      ? billingRecs.map(inv => {
+          const badge = inv.status === 'paid' ? 'badge-green' : inv.status === 'pending' ? 'badge-orange' : '';
+          return `<div class="queue-item" style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <div style="font-weight:600">${esc(inv.description || inv.service_tier)}</div>
+              <div style="font-size:13px;color:var(--ink-muted)">${fmtDate(inv.created_at)}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-weight:700">${fmtNGN(inv.amount_ngn)}</div>
+              <span class="badge ${badge}">${esc(inv.status)}</span>
+            </div>
+          </div>`;
+        }).join('')
+      : '<div style="color:var(--ink-muted);font-size:14px;padding:12px 0">No payment history yet.</div>';
+
   } catch(err) {
-    document.getElementById('billing-current').innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    currentEl.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
 }
 
-async function subscribe(tier) {
+async function subscribe(tier, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Processing…'; }
   try {
-    // Try Paystack checkout first; fall back to direct if not configured
-    const res = await apiPost('/api/billing/paystack/initialize', { tier }).catch(() => null);
-    if (res && res.authorization_url) {
-      window.location.href = res.authorization_url;
+    // Try Paystack checkout first
+    const ps = await apiPost('/api/billing/paystack/initialize', { tier }).catch(() => null);
+    if (ps?.authorization_url) {
+      window.location.href = ps.authorization_url;
       return;
     }
+    // Direct activation (no Paystack configured)
     await apiPost('/api/billing/subscribe', { tier, seat_count: 1 });
-    loadBilling();
-  } catch(err) { alert(err.message); }
+    await loadBilling();
+    // Scroll to current plan banner
+    document.getElementById('billing-current').scrollIntoView({ behavior: 'smooth' });
+  } catch(err) {
+    if (btn) { btn.disabled = false; btn.textContent = `Activate ${_billingTiers[tier]?.name || tier}`; }
+    alert(err.message);
+  }
 }
 
 async function cancelSub() {
