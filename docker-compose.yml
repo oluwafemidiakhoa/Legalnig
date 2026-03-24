@@ -1,0 +1,21 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: lexpilot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lexpilot
+      POSTGRES_USER: lexpilot
+      POSTGRES_PASSWORD: lexpilot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lexpilot -d lexpilot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
