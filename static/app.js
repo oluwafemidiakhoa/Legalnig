@@ -1,4 +1,4 @@
-/* ── LexPilot NG — full client ─────────────────────────────────────────── */
+/* ── CounselAI — full client ─────────────────────────────────────────── */
 'use strict';
 
 /* ── Auth state ─────────────────────────────────────────────────────────── */
@@ -760,6 +760,12 @@ async function loadBilling() {
 
 async function subscribe(tier) {
   try {
+    // Try Paystack checkout first; fall back to direct if not configured
+    const res = await apiPost('/api/billing/paystack/initialize', { tier }).catch(() => null);
+    if (res && res.authorization_url) {
+      window.location.href = res.authorization_url;
+      return;
+    }
     await apiPost('/api/billing/subscribe', { tier, seat_count: 1 });
     loadBilling();
   } catch(err) { alert(err.message); }

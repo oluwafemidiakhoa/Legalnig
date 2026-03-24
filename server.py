@@ -76,6 +76,13 @@ from legal_mvp.storage import (
     update_user_matter_ids,
     upsert_matter,
 )
+from legal_mvp.email_service import (
+    send_welcome,
+    send_matter_created,
+    send_contract_approved,
+    send_payment_receipt,
+)
+from legal_mvp.paystack import initialize_transaction, verify_transaction, verify_webhook_signature
 from legal_mvp.templates import fill_template, list_templates
 from legal_mvp.workflows import build_intake_request, create_record
 from legal_mvp.models import GeneratedDocument
@@ -101,7 +108,7 @@ def json_default(value):
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "LexPilotNG/1.0"
+    server_version = "CounselAI/1.0"
 
     # ── Auth helpers ──────────────────────────────────────────────────────────
 
@@ -381,6 +388,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 save_user(user.to_dict())
                 session = create_session(user.to_dict())
                 save_session(session.to_dict())
+                try:
+                    send_welcome(email, display_name)
+                except Exception:
+                    pass
                 self.send_json({"user": safe_user_dict(user.to_dict()), "token": session.token}, status=HTTPStatus.CREATED)
                 return
 
@@ -421,6 +432,12 @@ class AppHandler(BaseHTTPRequestHandler):
                                "matter_type": record.entity_type, "summary": record.use_case}
                 obligations = generate_compliance_calendar(matter_dict)
                 save_compliance_obligations(record.matter_id, [o.to_dict() for o in obligations])
+                user = get_user_by_id(session["user_id"])
+                if user:
+                    try:
+                        send_matter_created(user["email"], user["display_name"], record.business_name, record.matter_id)
+                    except Exception:
+                        pass
                 self.send_json(record.to_dict(), status=HTTPStatus.CREATED)
                 return
 
@@ -675,7 +692,98 @@ class AppHandler(BaseHTTPRequestHandler):
                         "created_at": now,
                     }],
                 })
+                # Email submitter
+                cr = get_contract_review(review_id) or {}
+                submitter = get_user_by_id(cr.get("submitted_by_user_id", ""))
+                if submitter:
+                    try:
+                        send_contract_approved(submitter["email"], submitter["display_name"], cr.get("filename", "contract"))
+                    except Exception:
+                        pass
                 self.send_json({"contract_review": updated})
+                return
+
+            # ── Paystack ──────────────────────────────────────────────────────
+            if path == "/api/billing/paystack/initialize":
+                session = self._require_auth("sme_founder", "lawyer", "admin")
+                if not session:
+                    return
+                tier = str(payload.get("tier", "")).strip()
+                if tier not in ("starter", "growth", "scale", "law_firm"):
+                    raise ValueError("Invalid tier.")
+                user = get_user_by_id(session["user_id"])
+                if not user:
+                    raise LookupError("User not found.")
+                tier_def = TIER_DEFINITIONS.get(tier, {})
+                amount_ngn = float(tier_def.get("price_ngn", 0))
+                if amount_ngn <= 0:
+                    raise ValueError("This plan has no price configured.")
+                data = initialize_transaction(
+                    email=user["email"],
+                    amount_ngn=amount_ngn,
+                    tier=tier,
+                    user_id=session["user_id"],
+                )
+                self.send_json({"authorization_url": data["authorization_url"], "reference": data["reference"]})
+                return
+
+            if path == "/api/billing/paystack/verify":
+                session = self._require_auth("sme_founder", "lawyer", "admin")
+                if not session:
+                    return
+                reference = str(payload.get("reference", "")).strip()
+                if not reference:
+                    raise ValueError("reference is required.")
+                data = verify_transaction(reference)
+                metadata = data.get("metadata", {})
+                tier = metadata.get("tier", "starter")
+                amount_ngn = data["amount"] / 100
+                user = get_user_by_id(session["user_id"])
+                # Create billing record + subscription
+                billing_rec = create_billing_record(session["user_id"], tier, seat_count=1)
+                billing_rec_dict = billing_rec.to_dict()
+                billing_rec_dict["status"] = "paid"
+                billing_rec_dict["description"] = f"Paystack payment — ref {reference}"
+                save_billing_record(billing_rec_dict)
+                sub = create_subscription(session["user_id"], tier, seat_count=1)
+                save_subscription(sub.to_dict())
+                if user:
+                    try:
+                        send_payment_receipt(user["email"], user["display_name"], tier, amount_ngn, reference)
+                    except Exception:
+                        pass
+                self.send_json({"subscription": sub.to_dict(), "reference": reference})
+                return
+
+            if path == "/api/billing/paystack/webhook":
+                length = int(self.headers.get("Content-Length", "0"))
+                raw_body = self.rfile.read(length)
+                sig = self.headers.get("x-paystack-signature", "")
+                if not verify_webhook_signature(raw_body, sig):
+                    self.send_json({"error": "Invalid signature."}, status=HTTPStatus.FORBIDDEN)
+                    return
+                event = json.loads(raw_body.decode())
+                if event.get("event") == "charge.success":
+                    ref  = event["data"]["reference"]
+                    meta = event["data"].get("metadata", {})
+                    tier = meta.get("tier", "starter")
+                    user_id = meta.get("user_id", "")
+                    amount_ngn = event["data"]["amount"] / 100
+                    if user_id:
+                        billing_rec = create_billing_record(user_id, tier, seat_count=1)
+                        br = billing_rec.to_dict()
+                        br["status"] = "paid"
+                        br["description"] = f"Paystack webhook — ref {ref}"
+                        save_billing_record(br)
+                        sub = create_subscription(user_id, tier, seat_count=1)
+                        save_subscription(sub.to_dict())
+                        user = get_user_by_id(user_id)
+                        if user:
+                            try:
+                                send_payment_receipt(user["email"], user["display_name"], tier, amount_ngn, ref)
+                            except Exception:
+                                pass
+                self.send_json({"received": True})
                 return
 
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
@@ -733,7 +841,7 @@ def main() -> None:
     initialize_storage()
     server = ThreadingHTTPServer(("127.0.0.1", 8000), AppHandler)
     print(
-        "LexPilot NG running at http://127.0.0.1:8000 "
+        "CounselAI running at http://127.0.0.1:8000 "
         f"using {get_storage_backend_name()} storage"
     )
     try:

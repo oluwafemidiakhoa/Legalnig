@@ -108,7 +108,7 @@ OUTSTANDING ISSUES FOR LAWYER REVIEW
 2. ___________________________________________
 3. ___________________________________________
 
-Prepared by AI Legal Ops System — LexPilot NG
+Prepared by CounselAI
 Review and approval by: {lawyer_name}
 Date of lawyer review: ___________________________
 """,
@@ -218,7 +218,7 @@ Name: {employee_name}
 Witness: ___________________________ Date: ___________
 
 ─────────────────────────────────────────────
-Drafted by AI Legal Ops System — LexPilot NG
+Drafted by CounselAI
 Reviewed by: {lawyer_name}
 Date of lawyer review: ___________________________
 ─────────────────────────────────────────────
@@ -328,7 +328,7 @@ Consultant: ___________________________ Date: ___________
 Name: {consultant_name}
 
 ─────────────────────────────────────────────
-Drafted by AI Legal Ops System — LexPilot NG
+Drafted by CounselAI
 Reviewed by: {lawyer_name}
 Date of lawyer review: ___________________________
 ─────────────────────────────────────────────
@@ -435,7 +435,7 @@ Party B: ___________________________ Date: ___________
 Name: {receiving_party}
 
 ─────────────────────────────────────────────
-Drafted by AI Legal Ops System — LexPilot NG
+Drafted by CounselAI
 Reviewed by: {lawyer_name}
 Date of lawyer review: ___________________________
 ─────────────────────────────────────────────
@@ -565,7 +565,7 @@ SIGNATURES
 Each Shareholder: ___________________________ Date: ___________
 
 ─────────────────────────────────────────────
-Drafted by AI Legal Ops System — LexPilot NG
+Drafted by CounselAI
 Reviewed by: {lawyer_name}
 Date of lawyer review: ___________________________
 ─────────────────────────────────────────────
