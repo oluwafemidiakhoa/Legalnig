@@ -172,6 +172,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"tiers": TIER_DEFINITIONS})
                 return
 
+            if route == "/api/billing/config":
+                from legal_mvp.paystack import PUBLIC_KEY as _PK
+                self.send_json({"paystack_public_key": _PK or ""})
+                return
+
             # ── Auth endpoints (GET) ──────────────────────────────────────────
             if route == "/api/auth/me":
                 session = self._require_auth()
@@ -831,7 +836,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     tier=tier,
                     user_id=session["user_id"],
                 )
-                self.send_json({"authorization_url": data["authorization_url"], "reference": data["reference"]})
+                self.send_json({
+                    "authorization_url": data["authorization_url"],
+                    "access_code": data.get("access_code", ""),
+                    "reference": data["reference"],
+                })
                 return
 
             if path == "/api/billing/paystack/verify":

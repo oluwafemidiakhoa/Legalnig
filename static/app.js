@@ -30,6 +30,13 @@ async function api(method, path, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined
   });
   const payload = await res.json().catch(() => ({}));
+  if (res.status === 402) {
+    // Limit reached — show upgrade modal instead of raw error
+    showUpgradeModal(payload.reason);
+    const err = new Error('limit_reached');
+    err.isLimitError = true;
+    throw err;
+  }
   if (!res.ok) throw new Error(payload.error || 'Request failed (' + res.status + ')');
   return payload;
 }
@@ -53,11 +60,34 @@ function fmtNGN(v) {
 /* ── Boot ───────────────────────────────────────────────────────────────── */
 function boot() {
   loadAuth();
+  // Detect return from Paystack redirect (fallback flow)
+  const params  = new URLSearchParams(window.location.search);
+  const psRef   = params.get('paystack_ref') || params.get('trxref') || params.get('reference');
+  // Clean the URL immediately so refreshing doesn't re-trigger
+  if (psRef) window.history.replaceState({}, '', window.location.pathname);
+
   if (AUTH.token && AUTH.user) {
     showAppShell();
+    if (psRef) _verifyPaystackReturn(psRef);
   } else {
     showAuthShell();
   }
+}
+
+async function _verifyPaystackReturn(ref) {
+  try {
+    await apiPost('/api/billing/paystack/verify', { reference: ref });
+    showView('billing');
+    _showPaymentToast();
+  } catch(e) {
+    alert('Payment verification failed: ' + e.message + '\nPlease contact support with ref: ' + ref);
+  }
+}
+
+function _showPaymentToast() {
+  const t = document.getElementById('payment-toast');
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 5000);
 }
 
 function showAuthShell() {
@@ -713,23 +743,77 @@ async function approveContract() {
   } catch(err) { alert(err.message); }
 }
 
-/* ── Billing ────────────────────────────────────────────────────────────── */
+/* ── Upgrade modal ──────────────────────────────────────────────────────── */
+const LIMIT_TITLES = {
+  qa_monthly_limit:       'Monthly Q&A limit reached',
+  daily_limit:            'Daily AI usage cap reached',
+  doc_monthly_limit:      'Monthly document limit reached',
+  doc_not_included:       'Documents not on your plan',
+  contract_not_included:  'Contract review not on your plan',
+  contract_monthly_limit: 'Monthly contract review limit reached',
+};
+const LIMIT_MESSAGES = {
+  qa_monthly_limit:       'You\'ve used all your free Q&A this month. Upgrade to Professional for unlimited cited legal answers.',
+  daily_limit:            'You\'ve hit today\'s AI usage cap. Come back tomorrow or upgrade to a paid plan for a higher daily limit.',
+  doc_monthly_limit:      'You\'ve generated all your documents for this month. Upgrade to generate more.',
+  doc_not_included:       'Document generation is not on the Free plan. Buy a single document for ₦5,000 or upgrade to Professional.',
+  contract_not_included:  'Contract review is not on the Free plan. Buy a single review for ₦15,000 or upgrade to Professional.',
+  contract_monthly_limit: 'You\'ve used all your contract reviews this month. Upgrade to Scale for unlimited reviews.',
+};
+
+function showUpgradeModal(reason) {
+  document.getElementById('upgrade-title').textContent   = LIMIT_TITLES[reason]   || 'Upgrade required';
+  document.getElementById('upgrade-message').textContent = LIMIT_MESSAGES[reason] || 'Upgrade your plan to continue.';
+  document.getElementById('upgrade-overlay').style.display = 'flex';
+}
+function closeUpgradeModal() {
+  document.getElementById('upgrade-overlay').style.display = 'none';
+}
+
+/* ── Billing ─────────────────────────────────────────────────────────────── */
 let _billingTiers = {};
+
+function _usageMeter(label, used, limit) {
+  if (limit === 0) {
+    return `<div style="margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+        <span style="font-weight:600">${esc(label)}</span>
+        <span style="color:var(--ink-muted)">Not on your plan</span>
+      </div>
+      <div style="height:6px;background:var(--line);border-radius:3px"></div>
+    </div>`;
+  }
+  const unlimited = limit === -1;
+  const pct = unlimited ? 20 : Math.min(100, Math.round((used / limit) * 100));
+  const barColor = pct >= 90 ? '#e53e3e' : pct >= 70 ? '#d97706' : '#1a855c';
+  const limitLabel = unlimited ? '∞' : limit;
+  return `<div style="margin-bottom:14px">
+    <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px">
+      <span style="font-weight:600">${esc(label)}</span>
+      <span style="color:var(--ink-muted)">${used} / ${limitLabel}</span>
+    </div>
+    <div style="height:6px;background:var(--line);border-radius:3px">
+      <div style="height:6px;width:${pct}%;background:${barColor};border-radius:3px;transition:width 0.4s"></div>
+    </div>
+  </div>`;
+}
 
 async function loadBilling() {
   const currentEl  = document.getElementById('billing-current');
   const tierGridEl = document.getElementById('tier-grid');
   const invoiceEl  = document.getElementById('invoice-list');
+  const usageEl    = document.getElementById('usage-meters');
   currentEl.innerHTML = '<div style="color:var(--ink-muted)">Loading…</div>';
 
   try {
-    const [tiersRes, subRes, invoicesRes] = await Promise.all([
+    const [tiersRes, subRes, invoicesRes, usageRes] = await Promise.all([
       apiGet('/api/billing/tiers'),
       apiGet('/api/billing/subscription').catch(() => ({})),
       apiGet('/api/billing/invoices').catch(() => ({})),
+      apiGet('/api/billing/usage').catch(() => null),
     ]);
-    _billingTiers   = tiersRes.tiers || {};
-    const sub       = subRes.subscription || null;
+    _billingTiers     = tiersRes.tiers || {};
+    const sub         = subRes.subscription || null;
     const billingRecs = subRes.billing_records || invoicesRes.items || [];
 
     // ── Current plan banner ──────────────────────────────────────────────
@@ -738,94 +822,159 @@ async function loadBilling() {
       currentEl.innerHTML = `
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
           <div>
-            <div style="font-weight:700;font-size:17px;margin-bottom:4px">
-              ${esc(td.name || sub.tier)} plan <span class="badge badge-green">${esc(sub.status)}</span>
+            <div style="font-weight:700;font-size:18px;margin-bottom:4px">
+              ${esc(td.name || sub.tier)} <span class="badge badge-green">${esc(sub.status)}</span>
             </div>
             <div style="color:var(--ink-muted);font-size:14px">
-              ${fmtNGN(td.price_ngn || 0)} · Next billing: ${fmtDate(sub.next_billing_at)}
+              ${fmtNGN(td.price_ngn || 0)} / month &nbsp;·&nbsp; Next billing: ${fmtDate(sub.next_billing_at)}
             </div>
           </div>
           <button class="btn btn-outline btn-sm" onclick="cancelSub()">Cancel subscription</button>
         </div>`;
-    } else if (billingRecs.length) {
-      // One-time purchase (no subscription record)
-      const last = billingRecs[0];
+    } else if (billingRecs.filter(r => r.status === 'paid').length) {
+      const last = billingRecs.find(r => r.status === 'paid') || billingRecs[0];
       const td   = _billingTiers[last.service_tier] || {};
       currentEl.innerHTML = `
-        <div style="font-weight:700;font-size:17px;margin-bottom:4px">
+        <div style="font-weight:700;font-size:18px;margin-bottom:4px">
           ${esc(td.name || last.service_tier)} <span class="badge badge-green">Active</span>
         </div>
-        <div style="color:var(--ink-muted);font-size:14px">One-time purchase · Paid ${fmtDate(last.created_at)}</div>`;
+        <div style="color:var(--ink-muted);font-size:14px">
+          One-time purchase &nbsp;·&nbsp; Paid ${fmtDate(last.created_at)} &nbsp;·&nbsp; ${fmtNGN(last.amount_ngn)}
+        </div>`;
     } else {
-      currentEl.innerHTML = `<div style="color:var(--ink-muted)">No active plan. Choose one below to unlock full access.</div>`;
+      currentEl.innerHTML = `
+        <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+          <div style="font-size:28px">🎉</div>
+          <div>
+            <div style="font-weight:700;font-size:17px">You're on the Free plan</div>
+            <div style="color:var(--ink-muted);font-size:14px;margin-top:2px">
+              3 legal Q&amp;As per month · 1 active matter · Compliance calendar view
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="document.getElementById('tier-grid').scrollIntoView({behavior:'smooth'})">
+            Upgrade to unlock more →
+          </button>
+        </div>`;
+    }
+
+    // ── Usage meters ─────────────────────────────────────────────────────
+    if (usageRes && usageEl) {
+      const td = _billingTiers[usageRes.tier] || {};
+      usageEl.innerHTML =
+        _usageMeter('Legal Q&A answers',    usageRes.monthly_qa_used,        td.qa_monthly_limit ?? 3) +
+        _usageMeter('Documents generated',  usageRes.monthly_docs_used,      td.document_limit   ?? 0) +
+        _usageMeter('Contract reviews',     usageRes.monthly_contracts_used, td.contract_reviews ?? 0);
+    } else if (usageEl) {
+      usageEl.innerHTML = '<div style="color:var(--ink-muted);font-size:13px">Usage data unavailable.</div>';
     }
 
     // ── Tier grid ────────────────────────────────────────────────────────
-    const activeTier = sub?.tier || (billingRecs[0]?.service_tier);
+    const activeTier = sub?.tier || (billingRecs.find(r=>r.status==='paid')?.service_tier);
+    const POPULAR    = 'professional';
+
     tierGridEl.innerHTML = Object.entries(_billingTiers).map(([key, t]) => {
       const isActive  = activeTier === key;
       const isOneTime = t.billing_type === 'one_time';
-      const isCustom  = !t.price_ngn;
-      const priceLabel = isCustom
-        ? '<span style="font-size:18px;font-weight:700">Custom</span>'
-        : `<span style="font-size:22px;font-weight:700">${fmtNGN(t.price_ngn)}</span>`
-          + `<span style="font-size:13px;color:var(--ink-muted)"> ${isOneTime ? 'one-time' : '/ month'}</span>`;
+      const isFree    = t.billing_type === 'free';
+      const isCustom  = key === 'law_firm';
 
-      const btn = isActive
-        ? `<div class="badge badge-green" style="text-align:center;padding:10px">Current plan</div>`
-        : isCustom
-        ? `<a href="mailto:foundryai@getfoundryai.com?subject=Law Firm Plan Enquiry" class="btn btn-outline btn-sm" style="width:100%;text-align:center">Contact us</a>`
-        : `<button class="btn btn-primary btn-sm" style="width:100%" onclick="subscribe('${key}',this)">
-             Activate ${esc(t.name)}
-           </button>`;
+      const priceLabel = `<span style="font-size:24px;font-weight:800">${fmtNGN(t.price_ngn || 0)}</span>`
+        + `<span style="font-size:13px;color:var(--ink-muted)"> ${isFree ? 'forever' : isOneTime ? ' per use' : '/ month'}</span>`;
 
-      return `<div class="tier-card${isActive ? ' tier-current' : ''}">
+      let btn;
+      if (isActive) {
+        btn = `<div style="text-align:center;padding:10px;font-weight:600;color:#1a855c">✓ Your current plan</div>`;
+      } else if (isFree) {
+        btn = `<div style="text-align:center;padding:10px;font-size:13px;color:var(--ink-muted)">Active by default on sign-up</div>`;
+      } else if (isCustom) {
+        btn = `<a href="mailto:foundryai@getfoundryai.com?subject=Law Firm Plan Enquiry" class="btn btn-outline btn-sm" style="width:100%;text-align:center;display:block">Contact us →</a>`;
+      } else {
+        const label = isOneTime ? `Buy now — ${fmtNGN(t.price_ngn)}` : `Upgrade to ${esc(t.name)}`;
+        btn = `<button class="btn btn-primary btn-sm" style="width:100%" onclick="subscribe('${key}',this)">${label}</button>`;
+      }
+
+      const popularBadge = (key === POPULAR && !isActive)
+        ? `<div style="background:#1a855c;color:#fff;text-align:center;font-size:12px;font-weight:700;padding:5px;border-radius:6px 6px 0 0;margin:-1px -1px 0 -1px;letter-spacing:0.5px">⭐ MOST POPULAR</div>`
+        : '';
+
+      return `<div class="tier-card${isActive ? ' tier-current' : ''}${key===POPULAR&&!isActive?' tier-popular':''}">
+        ${popularBadge}
         <div class="tier-name">${esc(t.name)}</div>
-        <div class="tier-price" style="margin:12px 0">${priceLabel}</div>
+        <div style="font-size:12px;color:var(--ink-muted);margin-bottom:10px">${esc(t.description || '')}</div>
+        <div class="tier-price" style="margin:10px 0 14px">${priceLabel}</div>
         <ul class="tier-features" style="margin-bottom:16px">${(t.features||[]).map(f=>`<li>${esc(f)}</li>`).join('')}</ul>
         ${btn}
       </div>`;
     }).join('');
 
-    // ── Invoice history ──────────────────────────────────────────────────
-    invoiceEl.innerHTML = billingRecs.length
-      ? billingRecs.map(inv => {
-          const badge = inv.status === 'paid' ? 'badge-green' : inv.status === 'pending' ? 'badge-orange' : '';
-          return `<div class="queue-item" style="display:flex;justify-content:space-between;align-items:center">
+    // ── Payment history ──────────────────────────────────────────────────
+    const paidRecs = billingRecs.filter(r => r.status === 'paid');
+    invoiceEl.innerHTML = paidRecs.length
+      ? paidRecs.map(inv => `
+          <div class="queue-item" style="display:flex;justify-content:space-between;align-items:center">
             <div>
               <div style="font-weight:600">${esc(inv.description || inv.service_tier)}</div>
               <div style="font-size:13px;color:var(--ink-muted)">${fmtDate(inv.created_at)}</div>
             </div>
             <div style="text-align:right">
               <div style="font-weight:700">${fmtNGN(inv.amount_ngn)}</div>
-              <span class="badge ${badge}">${esc(inv.status)}</span>
+              <span class="badge badge-green">paid</span>
             </div>
-          </div>`;
-        }).join('')
+          </div>`).join('')
       : '<div style="color:var(--ink-muted);font-size:14px;padding:12px 0">No payment history yet.</div>';
 
   } catch(err) {
-    currentEl.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    if (!err.isLimitError) currentEl.innerHTML = `<div class="empty">${esc(err.message)}</div>`;
   }
 }
 
+/* ── Subscribe / pay ────────────────────────────────────────────────────── */
 async function subscribe(tier, btn) {
-  if (btn) { btn.disabled = true; btn.textContent = 'Processing…'; }
+  const tierName = _billingTiers[tier]?.name || tier;
+  if (btn) { btn.disabled = true; btn.textContent = 'Opening payment…'; }
+
   try {
-    // Try Paystack checkout first
+    // Ask backend to initialise a Paystack transaction
     const ps = await apiPost('/api/billing/paystack/initialize', { tier }).catch(() => null);
+
+    if (ps?.access_code && window.PaystackPop) {
+      // ── Paystack Inline popup (best experience) ──────────────────────
+      window.PaystackPop.resumeTransaction(ps.access_code, {
+        callback: async function(response) {
+          try {
+            if (btn) { btn.textContent = 'Verifying…'; }
+            await apiPost('/api/billing/paystack/verify', { reference: response.reference });
+            _showPaymentToast();
+            await loadBilling();
+          } catch(e) {
+            alert('Payment received but verification failed: ' + e.message + '\nReference: ' + response.reference);
+            await loadBilling();
+          }
+          if (btn) { btn.disabled = false; btn.textContent = tierName; }
+        },
+        onClose: function() {
+          if (btn) { btn.disabled = false; btn.textContent = `Upgrade to ${tierName}`; }
+        }
+      });
+      return;   // popup is open — button stays disabled until callback/onClose fires
+    }
+
     if (ps?.authorization_url) {
+      // ── Fallback: full-page redirect (mobile / no inline.js loaded) ──
       window.location.href = ps.authorization_url;
       return;
     }
-    // Direct activation (no Paystack configured)
+
+    // ── No Paystack configured: sandbox / direct activation ─────────────
     await apiPost('/api/billing/subscribe', { tier, seat_count: 1 });
+    _showPaymentToast();
     await loadBilling();
-    // Scroll to current plan banner
     document.getElementById('billing-current').scrollIntoView({ behavior: 'smooth' });
+    if (btn) { btn.disabled = false; btn.textContent = `Upgrade to ${tierName}`; }
+
   } catch(err) {
-    if (btn) { btn.disabled = false; btn.textContent = `Activate ${_billingTiers[tier]?.name || tier}`; }
-    alert(err.message);
+    if (btn) { btn.disabled = false; btn.textContent = `Upgrade to ${tierName}`; }
+    if (!err.isLimitError) alert(err.message);
   }
 }
 
@@ -833,7 +982,7 @@ async function cancelSub() {
   if (!confirm('Cancel your subscription? This will take effect immediately.')) return;
   try {
     await apiPost('/api/billing/cancel', {});
-    loadBilling();
+    await loadBilling();
   } catch(err) { alert(err.message); }
 }
 

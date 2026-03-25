@@ -12,6 +12,7 @@ from uuid import uuid4
 BASE_URL   = "https://api.paystack.co"
 SECRET_KEY = os.environ.get("PAYSTACK_SECRET_KEY", "")
 PUBLIC_KEY = os.environ.get("PAYSTACK_PUBLIC_KEY", "")
+APP_URL    = os.environ.get("APP_URL", "http://127.0.0.1:8000")
 ENABLED    = bool(SECRET_KEY)
 
 
@@ -36,7 +37,7 @@ def initialize_transaction(
     amount_ngn: float,
     tier: str,
     user_id: str,
-    callback_url: str = "http://127.0.0.1:8000/api/billing/verify",
+    callback_url: str | None = None,
 ) -> dict:
     """
     Returns Paystack authorization_url, access_code, reference.
@@ -44,14 +45,16 @@ def initialize_transaction(
     """
     if not ENABLED:
         raise RuntimeError("PAYSTACK_SECRET_KEY is not configured.")
-    reference = f"FL-{tier[:3].upper()}-{uuid4().hex[:10].upper()}"
+    reference = f"CA-{tier[:3].upper()}-{uuid4().hex[:10].upper()}"
+    if callback_url is None:
+        callback_url = f"{APP_URL}/?paystack_ref={reference}"
     payload = {
         "email": email,
         "amount": int(amount_ngn * 100),   # kobo
         "currency": "NGN",
         "reference": reference,
         "callback_url": callback_url,
-        "metadata": {"tier": tier, "user_id": user_id},
+        "metadata": {"tier": tier, "user_id": user_id, "cancel_action": APP_URL},
     }
     result = _request("POST", "/transaction/initialize", payload)
     if not result.get("status"):
