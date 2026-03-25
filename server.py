@@ -955,10 +955,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    import os as _os
     initialize_storage()
-    server = ThreadingHTTPServer(("127.0.0.1", 8000), AppHandler)
+    port = int(_os.environ.get("PORT", 8000))
+    host = "0.0.0.0"
+    server = ThreadingHTTPServer((host, port), AppHandler)
     print(
-        "CounselAI running at http://127.0.0.1:8000 "
+        f"CounselAI running at http://{host}:{port} "
         f"using {get_storage_backend_name()} storage"
     )
     try:
